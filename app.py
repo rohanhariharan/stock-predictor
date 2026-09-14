@@ -114,13 +114,48 @@ def iv_tab() -> None:
                 "Two or more samples per expiration are needed to draw a line.")
         return
 
+    # IV ratio between the first two selected expirations (numerator / denominator).
+    ratio_n = ratio_d = None
+    ratio_pts = []
+    ratio_pair = [
+        (a, b)
+        for a in chosen
+        for b in chosen
+        if a != b and a in bucket and b in bucket
+    ]
+    if ratio_pair:
+        ratio_n, ratio_d = ratio_pair[0]
+        ratio_times = [p[0] for p in bucket[ratio_n]]
+        ratio_d_pts = {p[0]: p[1] for p in bucket[ratio_d]}
+        ratio_pts = [
+            (t, n / ratio_d_pts[t]) for t, (_, n) in zip(ratio_times, bucket[ratio_n])
+            if t in ratio_d_pts and ratio_d_pts[t]
+        ]
+        if len(ratio_pts) > 1:
+            ratio_trace = go.Scatter(
+                x=[p[0] for p in ratio_pts],
+                y=[p[1] for p in ratio_pts],
+                mode="lines+markers",
+                name=f"IV ratio {ratio_n} / {ratio_d}",
+                line=dict(color="#9467bd", width=2, dash="dot"),
+                marker=dict(size=4),
+                yaxis="y2",
+            )
+            traces.append(ratio_trace)
+
     latest = pd.Series(
         {ey: bucket[ey][-1][1] for ey in chosen if ey in bucket}
     )
     c1, c2, c3 = st.columns(3)
     c1.metric("Spot", f"${iv_info['spot']:,.2f}")
     c2.metric("Avg IV (selected)", f"{latest.mean():.1%}")
-    c3.metric("Latest sample", now.strftime("%H:%M:%S"))
+    if ratio_n and ratio_d and len(ratio_pts) > 1:
+        c3.metric(
+            f"IV ratio ({ratio_n} / {ratio_d})",
+            f"{ratio_pts[-1][1]:,.2f}",
+        )
+    else:
+        c3.metric("Latest sample", now.strftime("%H:%M:%S"))
 
     fig = go.Figure(data=traces)
     fig.update_layout(
@@ -133,8 +168,16 @@ def iv_tab() -> None:
         margin=dict(l=40, r=20, t=60, b=60),
         template="plotly_white",
     )
+    if ratio_n and ratio_d and len(ratio_pts) > 1:
+        fig.update_layout(
+            yaxis2=dict(
+                title="IV ratio",
+                overlaying="y",
+                side="right",
+                showgrid=False,
+            )
+        )
     st.plotly_chart(fig, use_container_width=True)
-
     with st.expander("📋 View accumulated samples", expanded=False):
         series = {
             ey: pd.Series([p[1] for p in bucket[ey]],
