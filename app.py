@@ -32,108 +32,122 @@ st.caption("Train XGBoost on maximum history → forecast the next close → ove
 
 # ---- Implied volatility tab (options chains) --------------------------------
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_iv(symbol: str, expiry: str | None) -> tuple[pd.DataFrame, dict] | None:
-    """Fetch at-the-money IV per expiration for *symbol* (options data)."""
+def get_chain(symbol: str) -> tuple[pd.DataFrame, dict] | None:
+    """Fetch the at-the-money IV per expiration for *symbol* (live, uncached)."""
     try:
-        return model.atm_iv_by_expiry(symbol, expiry=expiry)
+        return model.atm_iv_by_expiry(symbol)
     except ValueError:
         return None
 
 
 def iv_tab() -> None:
-    """Render the 'Implied Volatility' tab with multi-symbol overlays."""
-    st.subheader("Implied volatility over available expirations")
+    """Render the 'Implied Volatility' tab.
+
+    Single symbol; the user picks which expirations to display. IV is fetched
+    fresh on every rerun and accumulated in session state, so with auto-refresh
+    on you get a live IV-over-time overlay that builds up during the session.
+    """
+    st.subheader("Realtime implied volatility (by expiration)")
     st.caption(
-        "At-the-money IV per options expiration, derived from each symbol's "
-        "Yahoo chain. Symbols with an active IV line are overlaid on one chart."
+        "Pick one symbol and choose expirations. IV is polled on every refresh "
+        "and an over-time series is accumulated while this tab is open."
     )
-
-    with st.expander("ℹ️ How this IV works", expanded=False):
-        st.markdown(
-            "- IV is read from the **at-the-money call** (strike nearest spot).\n"
-            "- Each expiration is a point on the x-axis, so the chart shows how "
-            "the market prices uncertainty across maturity.\n"
-            "- This is a snapshot of the current chain, not a long intraday "
-            "history (yfinance exposes available expiries, not historical IV)."
-        )
-
-    st.divider()
 
     with st.sidebar:
         st.markdown("")
         st.subheader("📉 Implied volatility")
-        iv_symbols = st.multiselect(
-            "Symbols to overlay",
-            options=_IV_SAMPLES,
-            default=["AAPL", "NVDA"],
-            help="Each symbol becomes its own IV line.",
-        )
+        iv_symbol = st.text_input(
+            "IV symbol", value="AAPL", max_chars=10
+        ).strip().upper()
 
-    if not iv_symbols:
-        st.info("Pick at least one symbol for the implied-volatility tab.")
+        avail_dates: list[str] = []
+        result = get_chain(iv_symbol) if iv_symbol else None
+        if result is not None:
+            iv_df, iv_info = result
+            avail_dates = [str(d.date()) for d in iv_df.index]
+            chosen = st.multiselect(
+                "Expirations to show",
+                options=avail_dates,
+                default=avail_dates[:2],
+                help="Each selected expiration becomes its own IV line.",
+            )
+        else:
+            chosen = []
+
+    if not iv_symbol or result is None:
+        if iv_symbol:
+            st.warning(f"No options chain available for '{iv_symbol}'.")
+        else:
+            st.info("Enter a symbol on the left, then pick expirations.")
         return
 
-    loaded: dict[str, tuple[pd.DataFrame, dict]] = {}
-    errors = []
-    for sym in iv_symbols:
-        iv_sets = get_iv(sym, expiry=None)
-        if iv_sets is None:
-            errors.append(sym)
-            continue
-        iv_df, iv_info = iv_sets
-        if iv_df.empty:
-            errors.append(sym)
-            continue
-        loaded[sym.upper()] = iv_sets
+    # Accumulate a live IV-over-time history per (symbol, expiry) across reruns.
+    hist = st.session_state.setdefault("iv_hist", {})
+    bucket = hist.setdefault(iv_symbol, {})
+    now = dt.datetime.now()
+    cap = 400
+    for exp, iv_val in iv_df["atm_iv"].items():
+        ey = str(exp.date())
+        pts = bucket.setdefault(ey, [])
+        pts.append((now, float(iv_val)))
+        bucket[ey] = pts[-cap:]
 
-    if errors:
-        st.warning(
-            "No options chain available for: " + ", ".join(errors)
+    if not chosen:
+        st.info("Pick at least one expiration on the left to plot IV over time.")
+        return
+
+    traces = [
+        go.Scatter(
+            x=[p[0] for p in bucket[ey]],
+            y=[p[1] for p in bucket[ey]],
+            mode="lines+markers",
+            name=f"{ey} expiry",
+            line=dict(width=2),
+            marker=dict(size=4),
         )
+        for ey in chosen
+        if ey in bucket and len(bucket[ey]) > 1
+    ]
 
-    if loaded:
-        traces = [
-            go.Scatter(
-                x=iv_df.index,
-                y=iv_df["atm_iv"],
-                mode="lines+markers",
-                name=f"{sym} (spot ${iv_info['spot']:,.2f})",
-                line=dict(width=2),
-                marker=dict(size=6),
-            )
-            for sym, (iv_df, iv_info) in loaded.items()
-        ]
-        all_iv = pd.concat(
-            [iv_df["atm_iv"] for iv_df, _ in loaded.values()], keys=list(loaded)
-        )
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Symbols shown", str(len(loaded)))
-        c2.metric("Avg IV (all expiries shown)", f"{all_iv.mean():.1%}")
-        c3.metric("IV range", f"{all_iv.min():.1%} – {all_iv.max():.1%}")
+    if not traces:
+        st.info("Collecting IV points… keep the tab open through a refresh cycle. "
+                "Two or more samples per expiration are needed to draw a line.")
+        return
 
-        fig = go.Figure(data=traces)
-        fig.update_layout(
-            title="ATM Implied Volatility by Expiration",
-            xaxis_title="Option expiration",
-            yaxis_title="Implied volatility",
-            yaxis_tickformat=".0%",
-            legend=dict(orientation="h", y=-0.2, x=0),
-            hovermode="x unified",
-            margin=dict(l=40, r=20, t=60, b=60),
-            template="plotly_white",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    latest = pd.Series(
+        {ey: bucket[ey][-1][1] for ey in chosen if ey in bucket}
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Spot", f"${iv_info['spot']:,.2f}")
+    c2.metric("Avg IV (selected)", f"{latest.mean():.1%}")
+    c3.metric("Latest sample", now.strftime("%H:%M:%S"))
 
-        with st.expander("📋 View raw IV values", expanded=False):
-            series = {
-                sym: iv_df["atm_iv"] for sym, (iv_df, _) in loaded.items()
-            }
-            raw = pd.DataFrame(series).sort_index()
-            raw.index.name = "Expiration"
-            st.dataframe(raw.style.format("{:.1%}"), use_container_width=True)
-    elif not errors:
-        st.info("No implied-volatility data returned for the selected symbols.")
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title=f"{iv_symbol} — ATM IV over time by expiration (points: {now:%Y-%m-%d %H:%M})",
+        xaxis_title="Time",
+        yaxis_title="Implied volatility",
+        yaxis_tickformat=".0%",
+        legend=dict(orientation="h", y=-0.2, x=0),
+        hovermode="x unified",
+        margin=dict(l=40, r=20, t=60, b=60),
+        template="plotly_white",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("📋 View accumulated samples", expanded=False):
+        series = {
+            ey: pd.Series([p[1] for p in bucket[ey]],
+                          index=[p[0] for p in bucket[ey]])
+            for ey in chosen
+        }
+        raw = pd.DataFrame(series).sort_index()
+        raw.index.name = "Sample time"
+        st.dataframe(raw.style.format("{:.1%}"), use_container_width=True)
+    st.caption(
+        f"{len(bucket)} expirations tracked · {len(chosen)} plotted · "
+        f"history resets if you change the symbol."
+    )
 
 
 # Data + model are cached together (keyed by symbol). Auto-refresh clears this
@@ -298,7 +312,6 @@ def run(symbol: str, auto: bool) -> None:
 
 
 # ---- Sidebar input + main flow ----------------------------------------------
-_IV_SAMPLES = ["AAPL", "MSFT", "GOOGL", "NVDA", "TSLA", "AMZN", "META"]
 with st.sidebar:
     st.header("⚙️ Settings")
     default_symbol = st.text_input("Stock symbol", value="AAPL", max_chars=10)
