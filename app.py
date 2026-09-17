@@ -197,23 +197,40 @@ def iv_tab() -> None:
     )
 
 
-# Data + model are cached together (keyed by symbol). Auto-refresh clears this
-# cache exactly once per chosen interval (see maybe_clear_cache), so a normal
-# browser rerun is cheap and re-fetches/re-trains only when the interval elapses.
+# Data + model are cached together (keyed by symbol + feature choices).
+# Auto-refresh clears this cache exactly once per chosen interval (see
+# maybe_clear_cache), so a normal browser rerun is cheap and re-fetches/re-trains
+# only when the interval elapses.
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_dashboard(symbol: str) -> tuple[pd.DataFrame, dict, object]:
-    """Fetch full history, train XGBoost, and forecast the next close."""
+def get_dashboard(
+    symbol: str, use_garch: bool = False, garch_p: int = 1, garch_q: int = 1
+) -> tuple[pd.DataFrame, dict, object, object]:
+    """Fetch full history, train XGBoost, and forecast the next close.
+
+    When *use_garch* is set, the GARCH conditional-volatility series is added to
+    the XGBoost feature set (and returned) so the model can condition on the
+    volatility regime.
+    """
     df = model.load_history(symbol)
-    X, y = model.build_features(df)
+    garch_vol = None
+    if use_garch:
+        try:
+            garch_vol = model.garch_conditional_vol(df, p=garch_p, q=garch_q)
+        except Exception:  # too little history / non-convergence
+            garch_vol = None
+
+    X, y = model.build_features(df, garch_vol=garch_vol)
     xgb_model, info = model.train_forecast_model(X, y)
     fc = {
-        "predicted_next": model.predict_next(xgb_model, df),
+        "predicted_next": model.predict_next(xgb_model, df, garch_vol=garch_vol),
         "mae": info["mae"],
         "train_size": info["train_size"],
         "test_size": info["test_size"],
         "total_rows": info["total_rows"],
+        "feature_count": X.shape[1],
+        "features": list(X.columns),
     }
-    return df, fc, xgb_model
+    return df, fc, xgb_model, garch_vol
 
 
 def maybe_clear_cache(interval_min: int, force: bool = False) -> None:
@@ -338,11 +355,14 @@ def garch_panel(symbol: str, vol: pd.DataFrame, horizon: int, window: int) -> No
 
 def run(symbol: str, auto: bool, horizon: int, arima_on: bool,
         arima_order: tuple[int, int, int], garch_on: bool,
-        garch_order: tuple[int, int], garch_window: int) -> None:
+        garch_order: tuple[int, int], garch_window: int,
+        feed_garch: bool, garch_feature_order: tuple[int, int]) -> None:
     """Render the full dashboard for one symbol (data already fetched/trained)."""
     with st.spinner("Fetching data & training XGBoost…"):
         try:
-            df, fc, xgb_model = get_dashboard(symbol)
+            df, fc, xgb_model, feat_garch_vol = get_dashboard(
+                symbol, feed_garch, *garch_feature_order
+            )
         except ValueError as e:
             st.error(str(e))
             return
@@ -351,12 +371,20 @@ def run(symbol: str, auto: bool, horizon: int, arima_on: bool,
         st.error(f"No data returned for {symbol}.")
         return
 
+    if feed_garch and feat_garch_vol is None:
+        st.warning(
+            "GARCH features were requested but the fit failed (not enough "
+            "history or non-convergence); XGBoost trained on the base features."
+        )
+
     predicted_next = fc["predicted_next"]
     info = fc
 
     # Recursive XGBoost forecast line (also gives the day-1 point).
     with st.spinner("Forecasting forward line…"):
-        xgb_line = model.forecast_recursive(xgb_model, df, steps=horizon)
+        xgb_line = model.forecast_recursive(
+            xgb_model, df, steps=horizon, garch_vol=feat_garch_vol
+        )
 
     arima_line = None
     if arima_on:
@@ -403,7 +431,8 @@ def run(symbol: str, auto: bool, horizon: int, arima_on: bool,
 
     st.caption(
         f"Trained on {info['total_rows']:,} contiguous days (the maximum usable "
-        f"from {len(history):,} fetched). Horizon = {horizon} trading day(s) ahead.  ·  "
+        f"from {len(history):,} fetched) with {info.get('feature_count', '?')} features. "
+        f"Horizon = {horizon} trading day(s) ahead.  ·  "
         f"{'🔄 Auto-refresh on' if auto else 'Auto-refresh off'} · "
         f"updated {dt.datetime.now():%H:%M:%S}"
     )
@@ -623,6 +652,31 @@ with st.sidebar:
     )
     garch_order = (int(garch_p), int(garch_q))
 
+    feed_garch = st.checkbox(
+        "Feed GARCH volatility into XGBoost",
+        value=False,
+        help="Adds the GARCH conditional volatility (+ 20-day ratio and change) "
+        "to the XGBoost feature set so it can condition on the volatility "
+        "regime. Retrains the model.",
+    )
+    if feed_garch:
+        f1, f2 = st.columns(2)
+        feat_p = f1.number_input(
+            "Feature GARCH p", min_value=1, max_value=3, value=1, step=1,
+            key="feat_garch_p",
+        )
+        feat_q = f2.number_input(
+            "Feature GARCH q", min_value=1, max_value=3, value=1, step=1,
+            key="feat_garch_q",
+        )
+        garch_feature_order = (int(feat_p), int(feat_q))
+        st.caption(
+            "⚠️ GARCH weights are fit on the full history, so the conditional "
+            "vol at early rows is mildly in-sample. Treat the MAE as optimistic."
+        )
+    else:
+        garch_feature_order = (1, 1)
+
     st.divider()
     st.caption(
         "- Fetches **maximum** Yahoo Finance history\n"
@@ -649,6 +703,8 @@ if symbol:
             garch_on=garch_on,
             garch_order=garch_order,
             garch_window=garch_window,
+            feed_garch=feed_garch,
+            garch_feature_order=garch_feature_order,
         )
     with tab_iv:
         iv_tab()
