@@ -57,7 +57,10 @@ def iv_tab() -> None:
         st.markdown("")
         st.subheader("📉 Implied volatility")
         iv_symbol = st.text_input(
-            "IV symbol", value="AAPL", max_chars=10
+            "IV symbol",
+            value="AAPL",
+            max_chars=20,
+            help="Any ticker with a Yahoo Finance options chain, e.g. AAPL, SPY.",
         ).strip().upper()
 
         avail_dates: list[str] = []
@@ -357,11 +360,17 @@ def run(symbol: str, auto: bool) -> None:
 # ---- Sidebar input + main flow ----------------------------------------------
 with st.sidebar:
     st.header("⚙️ Settings")
-    default_symbol = st.text_input("Stock symbol", value="AAPL", max_chars=10)
+    default_symbol = st.text_input(
+        "Stock symbol",
+        value="AAPL",
+        max_chars=20,
+        help="Any Yahoo Finance ticker, e.g. AAPL, BRK-B, ^GSPC, BTC-USD, ES=F.",
+    ).strip().upper()
     sample = st.selectbox(
         "Or pick a sample",
         ["", "AAPL", "MSFT", "GOOGL", "NVDA", "TSLA", "AMZN", "META"],
-        index=1,
+        index=0,
+        help="Overrides the typed symbol when a preset is selected.",
     )
     symbol = (sample or default_symbol).strip().upper()
 
