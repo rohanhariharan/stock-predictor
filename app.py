@@ -230,7 +230,7 @@ def maybe_clear_cache(interval_min: int, force: bool = False) -> None:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_arima(symbol: str, p: int, d: int, q: int, horizon: int) -> pd.Series:
+def get_arima(symbol: str, p: int, d: int, q: int, horizon: int) -> pd.DataFrame:
     """Fit ARIMA(order=(p, d, q)) and forecast *horizon* closes (cached)."""
     df = model.load_history(symbol)
     return model.forecast_arima(df, order=(p, d, q), steps=horizon)
@@ -339,10 +339,29 @@ def run(symbol: str, auto: bool, horizon: int, arima_on: bool,
             )
         )
     if arima_line is not None and not arima_line.empty:
+        band_x = [latest_date, *arima_line.index, *arima_line.index[::-1], latest_date]
+        # 95% band first (lighter), then 80% on top so both read clearly.
+        for lo_col, hi_col, alpha, label in (
+            ("lo95", "hi95", 0.12, "95% interval"),
+            ("lo80", "hi80", 0.22, "80% interval"),
+        ):
+            fig.add_trace(
+                go.Scatter(
+                    x=band_x,
+                    y=[latest_close, *arima_line[hi_col], *arima_line[lo_col][::-1], latest_close],
+                    mode="lines",
+                    fill="toself",
+                    fillcolor=f"rgba(148, 103, 189, {alpha})",
+                    line=dict(width=0),
+                    hoverinfo="skip",
+                    name=f"ARIMA {label}",
+                    showlegend=True,
+                )
+            )
         fig.add_trace(
             go.Scatter(
                 x=[latest_date, *arima_line.index],
-                y=[latest_close, *arima_line.to_numpy()],
+                y=[latest_close, *arima_line["mean"]],
                 mode="lines+markers",
                 name=f"ARIMA{arima_order} forecast",
                 line=dict(color="#9467bd", width=2, dash="dash"),
@@ -364,11 +383,20 @@ def run(symbol: str, auto: bool, horizon: int, arima_on: bool,
         template="plotly_white",
     )
     st.plotly_chart(fig, use_container_width=True)
+    if arima_line is not None and not arima_line.empty:
+        st.caption(
+            "ARIMA's flat line is the honest forecast: after differencing, daily "
+            "returns show almost no autocorrelation, so the best estimate is "
+            "roughly today's price. The shaded bands are the real signal — they "
+            "widen with horizon and show the range of plausible closes."
+        )
 
     # ---- Forecast table -----------------------------------------------------
     table = pd.DataFrame({"XGBoost": xgb_line})
-    if arima_line is not None:
-        table["ARIMA"] = arima_line
+    if arima_line is not None and not arima_line.empty:
+        table["ARIMA"] = arima_line["mean"]
+        table["ARIMA lo80"] = arima_line["lo80"]
+        table["ARIMA hi80"] = arima_line["hi80"]
     if not table.empty:
         with st.expander(f"📋 Forecast values ({horizon_label})", expanded=False):
             st.dataframe(

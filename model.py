@@ -173,12 +173,17 @@ def forecast_recursive(
 
 def forecast_arima(
     df: pd.DataFrame, order: Tuple[int, int, int] = (1, 1, 1), steps: int = 10
-) -> pd.Series:
+) -> pd.DataFrame:
     """Forecast the next *steps* closes with ARIMA on log prices.
 
     Fitting happens on ``log(Close)`` so the multiplicative price scale is
-    respected; predictions are exponentiated back to dollars. Dates mirror the
-    trading-day snapping used by the recursive XGBoost forecast.
+    respected; predictions and their prediction intervals are exponentiated back
+    to dollars. Dates mirror the trading-day snapping used by the recursive
+    XGBoost forecast.
+
+    Returns a frame indexed by forecast date with columns ``mean``, ``lo80``,
+    ``hi80``, ``lo95`` and ``hi95``. The bands widen with horizon, which for a
+    near-random-walk price is the only genuinely informative part of the output.
     """
     import warnings
 
@@ -186,7 +191,9 @@ def forecast_arima(
 
     steps = int(steps)
     if steps < 1:
-        return pd.Series(dtype=float)
+        return pd.DataFrame(
+            columns=["mean", "lo80", "hi80", "lo95", "hi95"], dtype=float
+        )
 
     log_price = np.log(df["Close"].astype(float))
     with warnings.catch_warnings():
@@ -194,7 +201,10 @@ def forecast_arima(
         # Fit on plain values: the yfinance index is tz-aware and has holiday
         # gaps, which statsmodels rejects as "no supported index".
         result = ARIMA(log_price.to_numpy(), order=tuple(order)).fit()
-        mean = np.exp(np.asarray(result.forecast(steps=steps), dtype=float))
+        fc = result.get_forecast(steps=steps)
+        mean = np.exp(np.asarray(fc.predicted_mean, dtype=float))
+        ci80 = np.exp(np.asarray(fc.conf_int(alpha=0.20), dtype=float))
+        ci95 = np.exp(np.asarray(fc.conf_int(alpha=0.05), dtype=float))
 
     dates: list[pd.Timestamp] = []
     cursor = df.index[-1]
@@ -204,7 +214,16 @@ def forecast_arima(
             cursor += pd.Timedelta(days=1)
         dates.append(cursor)
 
-    return pd.Series(mean, index=pd.DatetimeIndex(dates))
+    return pd.DataFrame(
+        {
+            "mean": mean,
+            "lo80": ci80[:, 0],
+            "hi80": ci80[:, 1],
+            "lo95": ci95[:, 0],
+            "hi95": ci95[:, 1],
+        },
+        index=pd.DatetimeIndex(dates),
+    )
 
 
 def atm_iv_by_expiry(
