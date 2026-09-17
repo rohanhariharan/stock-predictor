@@ -130,6 +130,83 @@ def predict_next(model: xgb.XGBRegressor, df: pd.DataFrame, lags: int = 12) -> f
     return max(float(price), 0.0)  # prices can't be negative
 
 
+def forecast_recursive(
+    model: xgb.XGBRegressor, df: pd.DataFrame, steps: int = 10, lags: int = 12
+) -> pd.Series:
+    """Recursively forecast the next *steps* closes, producing a forecast line.
+
+    Each predicted return is turned into a close and fed back in as the newest
+    observation, so the feature frame advances one trading day at a time. Future
+    rows reuse the last known volume and set High/Low equal to the predicted
+    close (intraday range is unknowable ahead of time), which only softens the
+    ``range_*`` features.
+    """
+    steps = int(steps)
+    if steps < 1:
+        return pd.Series(dtype=float)
+
+    work = df.copy()
+    last_volume = float(work["Volume"].iloc[-1]) if "Volume" in work.columns else 0.0
+    preds: list[float] = []
+    dates: list[pd.Timestamp] = []
+
+    for _ in range(steps):
+        feats = _feature_frame(work, lags)
+        if feats.empty:
+            break
+        pred_return = float(model.predict(feats.iloc[[-1]])[0])
+        new_close = max(float(work["Close"].iloc[-1]) * (1.0 + pred_return), 0.0)
+        preds.append(new_close)
+
+        next_day = work.index[-1] + pd.Timedelta(days=1)
+        while next_day.weekday() >= 5:
+            next_day += pd.Timedelta(days=1)
+        dates.append(next_day)
+
+        new_row = {col: new_close for col in work.columns}
+        if "Volume" in work.columns:
+            new_row["Volume"] = last_volume
+        work.loc[next_day] = new_row
+
+    return pd.Series(preds, index=pd.DatetimeIndex(dates))
+
+
+def forecast_arima(
+    df: pd.DataFrame, order: Tuple[int, int, int] = (1, 1, 1), steps: int = 10
+) -> pd.Series:
+    """Forecast the next *steps* closes with ARIMA on log prices.
+
+    Fitting happens on ``log(Close)`` so the multiplicative price scale is
+    respected; predictions are exponentiated back to dollars. Dates mirror the
+    trading-day snapping used by the recursive XGBoost forecast.
+    """
+    import warnings
+
+    from statsmodels.tsa.arima.model import ARIMA
+
+    steps = int(steps)
+    if steps < 1:
+        return pd.Series(dtype=float)
+
+    log_price = np.log(df["Close"].astype(float))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # Fit on plain values: the yfinance index is tz-aware and has holiday
+        # gaps, which statsmodels rejects as "no supported index".
+        result = ARIMA(log_price.to_numpy(), order=tuple(order)).fit()
+        mean = np.exp(np.asarray(result.forecast(steps=steps), dtype=float))
+
+    dates: list[pd.Timestamp] = []
+    cursor = df.index[-1]
+    for _ in range(steps):
+        cursor = cursor + pd.Timedelta(days=1)
+        while cursor.weekday() >= 5:
+            cursor += pd.Timedelta(days=1)
+        dates.append(cursor)
+
+    return pd.Series(mean, index=pd.DatetimeIndex(dates))
+
+
 def atm_iv_by_expiry(
     symbol: str, expiry: str | None = None
 ) -> Tuple[pd.DataFrame, dict]:

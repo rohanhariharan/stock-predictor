@@ -200,7 +200,7 @@ def iv_tab() -> None:
 # cache exactly once per chosen interval (see maybe_clear_cache), so a normal
 # browser rerun is cheap and re-fetches/re-trains only when the interval elapses.
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_dashboard(symbol: str) -> tuple[pd.DataFrame, dict]:
+def get_dashboard(symbol: str) -> tuple[pd.DataFrame, dict, object]:
     """Fetch full history, train XGBoost, and forecast the next close."""
     df = model.load_history(symbol)
     X, y = model.build_features(df)
@@ -212,7 +212,7 @@ def get_dashboard(symbol: str) -> tuple[pd.DataFrame, dict]:
         "test_size": info["test_size"],
         "total_rows": info["total_rows"],
     }
-    return df, fc
+    return df, fc, xgb_model
 
 
 def maybe_clear_cache(interval_min: int, force: bool = False) -> None:
@@ -229,11 +229,19 @@ def maybe_clear_cache(interval_min: int, force: bool = False) -> None:
         st.session_state["last_clear"] = now
 
 
-def run(symbol: str, auto: bool) -> None:
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_arima(symbol: str, p: int, d: int, q: int, horizon: int) -> pd.Series:
+    """Fit ARIMA(order=(p, d, q)) and forecast *horizon* closes (cached)."""
+    df = model.load_history(symbol)
+    return model.forecast_arima(df, order=(p, d, q), steps=horizon)
+
+
+def run(symbol: str, auto: bool, horizon: int, arima_on: bool,
+        arima_order: tuple[int, int, int]) -> None:
     """Render the full dashboard for one symbol (data already fetched/trained)."""
     with st.spinner("Fetching data & training XGBoost…"):
         try:
-            df, fc = get_dashboard(symbol)
+            df, fc, xgb_model = get_dashboard(symbol)
         except ValueError as e:
             st.error(str(e))
             return
@@ -245,13 +253,21 @@ def run(symbol: str, auto: bool) -> None:
     predicted_next = fc["predicted_next"]
     info = fc
 
+    # Recursive XGBoost forecast line (also gives the day-1 point).
+    with st.spinner("Forecasting forward line…"):
+        xgb_line = model.forecast_recursive(xgb_model, df, steps=horizon)
+
+    arima_line = None
+    if arima_on:
+        try:
+            with st.spinner(f"Fitting ARIMA{arima_order}…"):
+                arima_line = get_arima(symbol, *arima_order, horizon)
+        except Exception as e:  # statsmodels raises many types
+            st.warning(f"ARIMA{arima_order} failed: {e}")
+
     history = df.copy()
     latest_close = float(history["Close"].iloc[-1])
     latest_date = history.index[-1]
-    next_date = latest_date + pd.Timedelta(days=1)
-    # Skip week-ends so the forecast marker sits on a trading day.
-    while next_date.weekday() >= 5:
-        next_date += pd.Timedelta(days=1)
 
     pct_change = (predicted_next / latest_close - 1.0) * 100.0
 
@@ -278,7 +294,7 @@ def run(symbol: str, auto: bool) -> None:
 
     st.caption(
         f"Trained on {info['total_rows']:,} contiguous days (the maximum usable "
-        f"from {len(history):,} fetched). Horizon = 1 trading day ahead.  ·  "
+        f"from {len(history):,} fetched). Horizon = {horizon} trading day(s) ahead.  ·  "
         f"{'🔄 Auto-refresh on' if auto else 'Auto-refresh off'} · "
         f"updated {dt.datetime.now():%H:%M:%S}"
     )
@@ -297,7 +313,7 @@ def run(symbol: str, auto: bool) -> None:
         )
     )
 
-    # Overlay: current value (actual) and the forecast (next point).
+    # Overlay: current value (actual) plus XGBoost / ARIMA forecast lines.
     fig.add_trace(
         go.Scatter(
             x=[latest_date],
@@ -310,22 +326,36 @@ def run(symbol: str, auto: bool) -> None:
             showlegend=True,
         )
     )
-    fig.add_trace(
-        go.Scatter(
-            x=[latest_date, next_date],
-            y=[latest_close, predicted_next],
-            mode="lines+markers",
-            name="Forecast → next close",
-            line=dict(color="#d62728", width=2, dash="dot"),
-            marker=dict(color="#d62728", size=12, symbol="star"),
-            text=[None, "Prediction"],
-            textposition="top center",
-            showlegend=True,
+    if not xgb_line.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=[latest_date, *xgb_line.index],
+                y=[latest_close, *xgb_line.to_numpy()],
+                mode="lines+markers",
+                name="XGBoost forecast",
+                line=dict(color="#d62728", width=2, dash="dot"),
+                marker=dict(color="#d62728", size=6),
+                showlegend=True,
+            )
         )
-    )
+    if arima_line is not None and not arima_line.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=[latest_date, *arima_line.index],
+                y=[latest_close, *arima_line.to_numpy()],
+                mode="lines+markers",
+                name=f"ARIMA{arima_order} forecast",
+                line=dict(color="#9467bd", width=2, dash="dash"),
+                marker=dict(color="#9467bd", size=6),
+                showlegend=True,
+            )
+        )
 
+    horizon_label = (
+        f"next {horizon} trading days" if horizon > 1 else "next close"
+    )
     fig.update_layout(
-        title=f"{symbol.upper()} — close with next-close forecast overlay (last {len(recent)} days)",
+        title=f"{symbol.upper()} — close with {horizon_label} forecast overlay (last {len(recent)} days)",
         xaxis_title="Date",
         yaxis_title="Price ($)",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
@@ -334,6 +364,16 @@ def run(symbol: str, auto: bool) -> None:
         template="plotly_white",
     )
     st.plotly_chart(fig, use_container_width=True)
+
+    # ---- Forecast table -----------------------------------------------------
+    table = pd.DataFrame({"XGBoost": xgb_line})
+    if arima_line is not None:
+        table["ARIMA"] = arima_line
+    if not table.empty:
+        with st.expander(f"📋 Forecast values ({horizon_label})", expanded=False):
+            st.dataframe(
+                table.style.format("${:,.2f}"), use_container_width=True
+            )
 
     # ---- Full-history mini chart -------------------------------------------
     st.subheader("Full history (maximum period fetched)")
@@ -396,10 +436,35 @@ with st.sidebar:
     )
 
     st.divider()
+    st.subheader("📐 Forecast horizon")
+    horizon = st.slider(
+        "Days ahead to forecast",
+        min_value=1,
+        max_value=30,
+        value=10,
+        help="Both XGBoost (recursive) and ARIMA are drawn as forecast lines "
+        "across this many trading days.",
+    )
+
+    st.divider()
+    st.subheader("📉 ARIMA overlay")
+    arima_on = st.checkbox(
+        "Show ARIMA forecast",
+        value=False,
+        help="Adds an ARIMA forecast line next to XGBoost. Fitting can take a "
+        "few seconds on long histories.",
+    )
+    c1, c2, c3 = st.columns(3)
+    arima_p = c1.number_input("p", min_value=0, max_value=5, value=1, step=1)
+    arima_d = c2.number_input("d", min_value=0, max_value=2, value=1, step=1)
+    arima_q = c3.number_input("q", min_value=0, max_value=5, value=1, step=1)
+    arima_order = (int(arima_p), int(arima_d), int(arima_q))
+
+    st.divider()
     st.caption(
         "- Fetches **maximum** Yahoo Finance history\n"
         "- Trains XGBoost (200–300 trees)\n"
-        "- Forecast horizon: 1 trading day ahead"
+        f"- Forecast horizon: {horizon} trading day(s) ahead"
     )
 
 if symbol:
@@ -412,7 +477,13 @@ if symbol:
         )
         maybe_clear_cache(interval_min)
     with tab_predict:
-        run(symbol, auto=enable_auto)
+        run(
+            symbol,
+            auto=enable_auto,
+            horizon=horizon,
+            arima_on=arima_on,
+            arima_order=arima_order,
+        )
     with tab_iv:
         iv_tab()
 else:
