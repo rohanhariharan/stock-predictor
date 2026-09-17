@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -236,8 +237,108 @@ def get_arima(symbol: str, p: int, d: int, q: int, horizon: int) -> pd.DataFrame
     return model.forecast_arima(df, order=(p, d, q), steps=horizon)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_garch(
+    symbol: str, p: int, q: int, horizon: int, window: int
+) -> pd.DataFrame:
+    """Fit GARCH(p, q) and return conditional volatility (cached).
+
+    Model parameters travel in ``.attrs``; they are picklable numeric types so
+    the cache round-trips them.
+    """
+    df = model.load_history(symbol)
+    return model.forecast_garch_volatility(
+        df, p=p, q=q, steps=horizon, window=window
+    )
+
+
+def garch_panel(symbol: str, vol: pd.DataFrame, horizon: int, window: int) -> None:
+    """Render the GARCH conditional-volatility chart and summary metrics."""
+    st.subheader("🌪️ GARCH conditional volatility")
+    st.caption(
+        "GARCH models the variance of returns, not their direction — so it "
+        "forecasts *how much* the stock will move, not *which way*. Fitted vol "
+        "is the model's estimate over recent history; the forecast line is its "
+        "forward view."
+    )
+    if vol is None or vol.empty:
+        st.info("No GARCH fit available.")
+        return
+
+    params = vol.attrs.get("params", {})
+    persistence = vol.attrs.get("persistence", float("nan"))
+    order = vol.attrs.get("order", (1, 1))
+    p, q = order
+
+    fitted = vol[vol["kind"] == "fitted"]
+    forecast = vol[vol["kind"] == "forecast"]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Latest daily vol", f"{fitted['vol'].iloc[-1]:.2f}%")
+    c2.metric(
+        f"Forecast (day {horizon})",
+        f"{forecast['vol'].iloc[-1]:.2f}%" if not forecast.empty else "—",
+    )
+    c3.metric(
+        "Persistence (α+β)",
+        f"{persistence:.3f}",
+        help="Above ~0.95 means volatility shocks decay very slowly.",
+    )
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=fitted.index,
+            y=fitted["vol"],
+            mode="lines",
+            name="Fitted (conditional) vol",
+            line=dict(color="#ff7f0e", width=2),
+        )
+    )
+    if not forecast.empty:
+        # Bridge from the last fitted point so the forecast line connects.
+        bridge_x = [fitted.index[-1], *forecast.index]
+        bridge_y = [fitted["vol"].iloc[-1], *forecast["vol"]]
+        fig.add_trace(
+            go.Scatter(
+                x=bridge_x,
+                y=bridge_y,
+                mode="lines+markers",
+                name=f"GARCH{p}{q} forecast",
+                line=dict(color="#d62728", width=2, dash="dot"),
+                marker=dict(color="#d62728", size=6),
+            )
+        )
+    fig.update_layout(
+        title=f"{symbol.upper()} — GARCH({p}, {q}) daily volatility (last {window} days + {horizon}-day forecast)",
+        xaxis_title="Date",
+        yaxis_title="Daily volatility (%)",
+        yaxis_ticksuffix="%",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        hovermode="x unified",
+        margin=dict(l=40, r=20, t=60, b=40),
+        template="plotly_white",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("📋 GARCH parameters", expanded=False):
+        if params:
+            st.dataframe(
+                pd.DataFrame(
+                    {"parameter": list(params), "value": list(params.values())}
+                ).style.format({"value": "{:.5f}"}),
+                use_container_width=True,
+            )
+        st.caption(
+            f"ω = long-run variance floor · α = reaction to recent shocks · "
+            f"β = memory of past variance · α+β = {persistence:.3f}. "
+            f"Annualized latest vol ≈ {float(fitted['vol'].iloc[-1]) * np.sqrt(252):.1f}%."
+        )
+
+
 def run(symbol: str, auto: bool, horizon: int, arima_on: bool,
-        arima_order: tuple[int, int, int]) -> None:
+        arima_order: tuple[int, int, int], garch_on: bool,
+        garch_order: tuple[int, int], garch_window: int) -> None:
     """Render the full dashboard for one symbol (data already fetched/trained)."""
     with st.spinner("Fetching data & training XGBoost…"):
         try:
@@ -264,6 +365,14 @@ def run(symbol: str, auto: bool, horizon: int, arima_on: bool,
                 arima_line = get_arima(symbol, *arima_order, horizon)
         except Exception as e:  # statsmodels raises many types
             st.warning(f"ARIMA{arima_order} failed: {e}")
+
+    garch_vol = None
+    if garch_on:
+        try:
+            with st.spinner(f"Fitting GARCH{garch_order}…"):
+                garch_vol = get_garch(symbol, *garch_order, horizon, garch_window)
+        except Exception as e:  # arch raises several types
+            st.warning(f"GARCH{garch_order} failed: {e}")
 
     history = df.copy()
     latest_close = float(history["Close"].iloc[-1])
@@ -403,6 +512,11 @@ def run(symbol: str, auto: bool, horizon: int, arima_on: bool,
                 table.style.format("${:,.2f}"), use_container_width=True
             )
 
+    # ---- GARCH volatility panel --------------------------------------------
+    if garch_on:
+        st.divider()
+        garch_panel(symbol, garch_vol, horizon, garch_window)
+
     # ---- Full-history mini chart -------------------------------------------
     st.subheader("Full history (maximum period fetched)")
     full_fig = go.Figure()
@@ -489,6 +603,27 @@ with st.sidebar:
     arima_order = (int(arima_p), int(arima_d), int(arima_q))
 
     st.divider()
+    st.subheader("🌪️ GARCH volatility")
+    garch_on = st.checkbox(
+        "Show GARCH volatility panel",
+        value=False,
+        help="Fits GARCH and charts conditional volatility (how much the stock "
+        "moves), not price direction.",
+    )
+    g1, g2 = st.columns(2)
+    garch_p = g1.number_input("GARCH p", min_value=1, max_value=3, value=1, step=1)
+    garch_q = g2.number_input("GARCH q", min_value=1, max_value=3, value=1, step=1)
+    garch_window = st.slider(
+        "History window (days)",
+        min_value=30,
+        max_value=252,
+        value=60,
+        step=10,
+        help="How much fitted conditional vol to draw before the forecast.",
+    )
+    garch_order = (int(garch_p), int(garch_q))
+
+    st.divider()
     st.caption(
         "- Fetches **maximum** Yahoo Finance history\n"
         "- Trains XGBoost (200–300 trees)\n"
@@ -511,6 +646,9 @@ if symbol:
             horizon=horizon,
             arima_on=arima_on,
             arima_order=arima_order,
+            garch_on=garch_on,
+            garch_order=garch_order,
+            garch_window=garch_window,
         )
     with tab_iv:
         iv_tab()

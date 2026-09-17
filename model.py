@@ -226,6 +226,71 @@ def forecast_arima(
     )
 
 
+def forecast_garch_volatility(
+    df: pd.DataFrame,
+    p: int = 1,
+    q: int = 1,
+    steps: int = 10,
+    window: int = 60,
+) -> pd.DataFrame:
+    """Fit GARCH(p, q) and return conditional volatility in percent per day.
+
+    GARCH models the *variance* of returns, not their direction, so this is a
+    volatility overlay rather than a price forecast. Returns an annualized-style
+    daily vol (%) over recent history plus the forward forecast, as a frame with
+    ``vol`` (in %), a ``kind`` column ('fitted' or 'forecast'), and the model's
+    fitted parameters and persistence in ``.attrs``.
+    """
+    import warnings
+
+    from arch import arch_model
+
+    steps = int(steps)
+    returns = (df["Close"].astype(float).pct_change().dropna() * 100.0)
+    if len(returns) < 50:
+        raise ValueError("Need at least 50 daily returns to fit GARCH.")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model_fit = arch_model(
+            returns.to_numpy(), vol="GARCH", p=int(p), q=int(q), dist="normal"
+        ).fit(disp="off")
+        fcast = model_fit.forecast(horizon=steps, reindex=False)
+        future_var = np.asarray(fcast.variance.to_numpy()).ravel()[:steps]
+        future_vol = np.sqrt(np.clip(future_var, 0.0, None))
+
+    # Conditional vol over the tail of history for the fitted/observed line.
+    fitted_vol = np.asarray(model_fit.conditional_volatility, dtype=float)
+    fitted_tail = fitted_vol[-window:]
+    hist_index = returns.index[-len(fitted_tail):]
+
+    # Forward dates, snapped the same way as the other forecasts.
+    future_dates: list[pd.Timestamp] = []
+    cursor = df.index[-1]
+    for _ in range(len(future_vol)):
+        cursor = cursor + pd.Timedelta(days=1)
+        while cursor.weekday() >= 5:
+            cursor += pd.Timedelta(days=1)
+        future_dates.append(cursor)
+
+    out = pd.DataFrame(
+        {
+            "vol": np.concatenate([fitted_tail, future_vol]),
+            "kind": ["fitted"] * len(fitted_tail) + ["forecast"] * len(future_vol),
+        },
+        index=pd.DatetimeIndex(list(hist_index) + future_dates),
+    )
+
+    params = dict(model_fit.params)
+    alpha = float(params.get("alpha[1]", 0.0))
+    beta = float(params.get("beta[1]", 0.0))
+    out.attrs["params"] = params
+    out.attrs["persistence"] = alpha + beta
+    out.attrs["order"] = (int(p), int(q))
+    out.attrs["last_vol"] = float(fitted_vol[-1])
+    return out
+
+
 def atm_iv_by_expiry(
     symbol: str, expiry: str | None = None
 ) -> Tuple[pd.DataFrame, dict]:
