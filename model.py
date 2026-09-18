@@ -182,6 +182,23 @@ def build_features(
     return X, y
 
 
+def predict_return(
+    model: xgb.XGBRegressor,
+    df: pd.DataFrame,
+    lags: int = 12,
+    garch_vol: pd.Series | None = None,
+) -> float:
+    """Predict the next-day simple return from the latest observed row.
+
+    Separated from :func:`predict_next` so callers can anchor the predicted
+    return to a live/intraday price instead of the last daily close.
+    """
+    feats = _feature_frame(df, lags, garch_vol)
+    if feats.empty:
+        raise ValueError("Not enough history to compute features.")
+    return float(model.predict(feats.iloc[[-1]])[0])
+
+
 def predict_next(
     model: xgb.XGBRegressor,
     df: pd.DataFrame,
@@ -194,9 +211,7 @@ def predict_next(
     return) does not exist yet — so it is never part of training. We build that
     row directly, predict the return, and turn it back into a price.
     """
-    feats = _feature_frame(df, lags, garch_vol)
-    last_row = feats.iloc[[-1]]
-    pred_return = float(model.predict(last_row)[0])
+    pred_return = predict_return(model, df, lags, garch_vol)
     price = df["Close"].iloc[-1] * (1.0 + pred_return)
     return max(float(price), 0.0)  # prices can't be negative
 

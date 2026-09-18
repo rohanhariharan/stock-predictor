@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 import typer
@@ -147,12 +148,136 @@ def fetch_intraday(symbol: str, interval: str = "1m") -> tuple[list[float], Opti
     return closes, stamp
 
 
-def build_dashboard(symbol: str, interval: str = "1m") -> Panel:
-    """Build the rich dashboard panel for *symbol*."""
-    try:
-        q = fetch_quote(symbol)
-    except ValueError as e:
-        return Panel(Text(str(e), style="bold red"), title="Error", border_style="red")
+@dataclass
+class ModelState:
+    """A trained XGBoost model plus the context needed to re-predict cheaply.
+
+    Training (and the GARCH fit) takes seconds, so it is done once and refreshed
+    only on a slow cadence; the live panel re-predicts from these in milliseconds
+    by anchoring the predicted *return* to the current price.
+    """
+
+    model: object
+    df: object
+    garch_vol: object
+    pred_return: float
+    mae: float
+    feature_count: int
+    trained_at: dt.datetime
+    uses_garch: bool
+
+
+def fit_model(symbol: str, use_garch: bool = True, garch_p: int = 1, garch_q: int = 1) -> ModelState:
+    """Fetch max history, fit GARCH (optional), and train XGBoost once."""
+    import model as ml
+
+    df = ml.load_history(symbol)
+
+    garch_vol = None
+    if use_garch:
+        try:
+            garch_vol = ml.garch_conditional_vol(df, p=garch_p, q=garch_q)
+        except Exception:
+            garch_vol = None
+
+    X, y = ml.build_features(df, garch_vol=garch_vol)
+    xgb_model, info = ml.train_forecast_model(X, y)
+    pred_return = ml.predict_return(xgb_model, df, garch_vol=garch_vol)
+
+    return ModelState(
+        model=xgb_model,
+        df=df,
+        garch_vol=garch_vol,
+        pred_return=pred_return,
+        mae=info["mae"],
+        feature_count=X.shape[1],
+        trained_at=dt.datetime.now(),
+        uses_garch=garch_vol is not None,
+    )
+
+
+def build_model_panel(state: Optional[ModelState], live_price: Optional[float]) -> Panel:
+    """Build the XGBoost prediction panel, anchored to *live_price*."""
+    if state is None:
+        return Panel(
+            Text("Model: fitting…", style="dim"),
+            title="🤖 XGBoost prediction",
+            border_style="grey50",
+            expand=False,
+            padding=(0, 2),
+        )
+
+    base = live_price if live_price is not None else float(state.df["Close"].iloc[-1])
+    predicted = max(base * (1.0 + state.pred_return), 0.0)
+    diff = predicted - base
+    pct = state.pred_return * 100.0
+
+    colour = "green" if diff > 0 else "red" if diff < 0 else "yellow"
+    arrow = "▲" if diff > 0 else "▼" if diff < 0 else "•"
+
+    pred_line = Text()
+    pred_line.append(f"{_fmt_price(predicted)}", style=f"bold {colour}")
+    pred_line.append(f"   {arrow} {pct:+.2f}% vs live", style=f"bold {colour}")
+
+    anchor = "live" if live_price is not None else "last close"
+    src = "with GARCH vol" if state.uses_garch else "no GARCH vol"
+    sub = Text(
+        f"next-close forecast · anchored to {anchor} · {src} · "
+        f"{state.feature_count} features",
+        style="dim",
+    )
+
+    stats = Table.grid(padding=(0, 2))
+    stats.add_column(justify="right", style="dim")
+    stats.add_column(justify="left")
+    stats.add_column(justify="right", style="dim")
+    stats.add_column(justify="left")
+    stats.add_row(
+        "Predicted",
+        _fmt_price(predicted),
+        "Change",
+        f"{diff:+,.2f}",
+    )
+    stats.add_row(
+        "Validation MAE",
+        f"{state.mae:.2%}",
+        "Trained",
+        state.trained_at.strftime("%H:%M:%S"),
+    )
+
+    body = Group(pred_line, sub, Text(""), stats)
+
+    return Panel(
+        body,
+        title="🤖 XGBoost prediction",
+        subtitle=(
+            "⚠️ near-random-walk target — treat as a demo"
+            if abs(pct) < 0.01
+            else "demo, not investment advice"
+        ),
+        border_style=colour,
+        expand=False,
+        padding=(0, 2),
+    )
+
+
+def build_dashboard(
+    symbol: str, interval: str = "1m", quote: Optional[dict] = None
+) -> Panel:
+    """Build the rich price panel for *symbol* (quote, stats, sparkline).
+
+    Pass *quote* to reuse an already-fetched quote and avoid a second network
+    round-trip on each live refresh.
+    """
+    if quote is None:
+        try:
+            q = fetch_quote(symbol)
+        except ValueError as e:
+            return Panel(
+                Text(str(e), style="bold red"), title="Error", border_style="red"
+            )
+    else:
+        q = quote
 
     last = q["last"]
     prev = q["prev_close"]
@@ -168,13 +293,13 @@ def build_dashboard(symbol: str, interval: str = "1m") -> Panel:
     pct = (change / prev * 100.0) if (change is not None and prev) else None
 
     if change is None:
-        trend, arrow, colour = "flat", "•", "yellow"
+        colour, arrow = "yellow", "•"
     elif change > 0:
-        trend, arrow, colour = "up", "▲", "green"
+        colour, arrow = "green", "▲"
     elif change < 0:
-        trend, arrow, colour = "down", "▼", "red"
+        colour, arrow = "red", "▼"
     else:
-        trend, arrow, colour = "flat", "•", "yellow"
+        colour, arrow = "yellow", "•"
 
     price_line = Text()
     price_line.append(f"{_fmt_price(last)}", style=f"bold {colour}")
@@ -246,6 +371,23 @@ def build_dashboard(symbol: str, interval: str = "1m") -> Panel:
     )
 
 
+def build_view(
+    symbol: str,
+    state: Optional[ModelState],
+    interval: str = "1m",
+) -> Group:
+    """Build the full view: price panel + XGBoost prediction panel below it."""
+    quote = None
+    try:
+        quote = fetch_quote(symbol)
+    except Exception:
+        quote = None
+
+    price_panel = build_dashboard(symbol, interval, quote=quote)
+    live_price = quote["last"] if quote else None
+    return Group(price_panel, build_model_panel(state, live_price))
+
+
 @app.command()
 def main(
     symbol: str = typer.Argument(..., help="Ticker symbol, e.g. AAPL"),
@@ -258,30 +400,69 @@ def main(
     interval: str = typer.Option(
         "1m", "--interval", "-i", help="Intraday bar size (finest is 1m)."
     ),
+    predict: bool = typer.Option(
+        True, "--predict/--no-predict", help="Show the XGBoost prediction panel."
+    ),
+    model_refresh: float = typer.Option(
+        900.0,
+        "--model-refresh",
+        help="Seconds between XGBoost retrains in watch mode (default 15 min).",
+    ),
+    no_garch: bool = typer.Option(
+        False, "--no-garch", help="Train XGBoost without GARCH volatility features."
+    ),
 ) -> None:
-    """Show a live dashboard for SYMBOL."""
+    """Show a live dashboard for SYMBOL, with an XGBoost forecast below it."""
     symbol = symbol.strip().upper()
     if not symbol:
         console.print("[bold red]Please provide a ticker symbol.[/bold red]")
         raise typer.Exit(code=1)
 
+    use_garch = not no_garch
+
     if not watch:
-        console.print(build_dashboard(symbol, interval))
+        state = None
+        if predict:
+            console.print("[dim]Fitting XGBoost…[/dim]")
+            try:
+                state = fit_model(symbol, use_garch=use_garch)
+            except ValueError as e:
+                console.print(f"[yellow]Model skipped: {e}[/yellow]")
+            except Exception as e:
+                console.print(f"[yellow]Model skipped: {e}[/yellow]")
+        console.print(build_view(symbol, state, interval))
         return
 
     refresh = max(1.0, refresh)
+    model_refresh = max(refresh, model_refresh)
+
+    state: Optional[ModelState] = None
+    if predict:
+        try:
+            with console.status("[dim]Fitting XGBoost…[/dim]"):
+                state = fit_model(symbol, use_garch=use_garch)
+        except Exception as e:
+            console.print(f"[yellow]Model skipped: {e}[/yellow]")
+
     try:
         with Live(
-            build_dashboard(symbol, interval),
+            build_view(symbol, state, interval),
             console=console,
             refresh_per_second=4,
-            screen=False,
+            screen=True,
         ) as live:
+            last_fit = time.monotonic()
             while True:
                 time.sleep(refresh)
-                live.update(build_dashboard(symbol, interval))
+                if predict and (time.monotonic() - last_fit) >= model_refresh:
+                    try:
+                        state = fit_model(symbol, use_garch=use_garch)
+                        last_fit = time.monotonic()
+                    except Exception:
+                        last_fit = time.monotonic()
+                live.update(build_view(symbol, state, interval))
     except KeyboardInterrupt:
-        console.print("\n[dim]Stopped.[/dim]")
+        console.print("[dim]Stopped.[/dim]")
 
 
 if __name__ == "__main__":
