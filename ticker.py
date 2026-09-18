@@ -28,8 +28,20 @@ from rich.text import Text
 # yfinance logs raw HTTP errors for bad symbols; keep our own output clean.
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
-app = typer.Typer(add_completion=False, help="Live price dashboard for a ticker.")
+app = typer.Typer(
+    add_completion=False, help="Live price dashboard for a ticker.", no_args_is_help=True
+)
 console = Console()
+
+
+def _set_prog_name() -> None:
+    """Show 'ticker' rather than 'ticker.py' in usage/help output."""
+    import sys
+
+    sys.argv[0] = "ticker"
+
+
+_set_prog_name()
 
 _BLOCKS = "▁▂▃▄▅▆▇█"
 

@@ -33,11 +33,16 @@ Your browser opens at http://localhost:8501. Enter a ticker (e.g. `AAPL`) or pic
 a sample, then press **Run / refresh**.
 
 ## Live ticker CLI
+Install the `ticker` command once:
 ```bash
-python ticker.py AAPL              # one-shot dashboard
-python ticker.py AAPL --watch      # continuous refresh (Ctrl-C to stop)
-python ticker.py AAPL -w -r 2      # refresh every 2s
-python ticker.py BTC-USD -i 5m     # 5-minute bars
+ln -sf /Users/rohanhariharan/xgboost/bin/ticker /Users/rohanhariharan/bin/ticker
+```
+Then, from anywhere:
+```bash
+ticker AAPL              # one-shot dashboard
+ticker AAPL --watch      # continuous refresh (Ctrl-C to stop)
+ticker AAPL -w -r 2      # refresh every 2s
+ticker BTC-USD -i 5m     # 5-minute bars
 ```
 Shows the freshest quote Yahoo exposes (most recent price) plus day stats and an
 intraday sparkline. Yahoo's finest granularity is **1-minute bars** — there is no
@@ -49,6 +54,7 @@ intraday sparkline. Yahoo's finest granularity is **1-minute bars** — there is
 | `app.py` | Streamlit UI: input, chart, metrics, forecast overlay |
 | `model.py` | Feature engineering, XGBoost training, next-close forecast (UI-free) |
 | `ticker.py` | Live ticker dashboard CLI (rich/typer) |
+| `bin/ticker` | Shell launcher installed onto `PATH` |
 
 ## Caveats
 - Stock forecasting from daily bars alone is noisy; treat results as a demo,

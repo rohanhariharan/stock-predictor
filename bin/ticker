@@ -1,0 +1,30 @@
+#!/bin/sh
+# Live ticker dashboard launcher.
+#
+# Install by symlinking (or copying) this onto your PATH, e.g.:
+#   ln -sf /Users/rohanhariharan/xgboost/bin/ticker /Users/rohanhariharan/bin/ticker
+#
+# Then:
+#   ticker AAPL
+#   ticker AAPL --watch
+set -e
+
+# Resolve symlinks (so a ~/bin/ticker -> repo/bin/ticker link still finds the repo).
+SOURCE="$0"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in
+    /*) ;;
+    *) SOURCE="$DIR/$SOURCE" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$SOURCE")/.." && pwd)"
+
+if [ -x "$REPO/.venv/bin/python" ]; then
+  PY="$REPO/.venv/bin/python"
+else
+  PY="$(command -v python3)"
+fi
+
+exec "$PY" "$REPO/ticker.py" "$@"
