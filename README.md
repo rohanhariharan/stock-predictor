@@ -32,11 +32,23 @@ streamlit run app.py
 Your browser opens at http://localhost:8501. Enter a ticker (e.g. `AAPL`) or pick
 a sample, then press **Run / refresh**.
 
+## Live ticker CLI
+```bash
+python ticker.py AAPL              # one-shot dashboard
+python ticker.py AAPL --watch      # continuous refresh (Ctrl-C to stop)
+python ticker.py AAPL -w -r 2      # refresh every 2s
+python ticker.py BTC-USD -i 5m     # 5-minute bars
+```
+Shows the freshest quote Yahoo exposes (most recent price) plus day stats and an
+intraday sparkline. Yahoo's finest granularity is **1-minute bars** — there is no
+1-second feed.
+
 ## Files
 | File | Purpose |
 |------|---------|
 | `app.py` | Streamlit UI: input, chart, metrics, forecast overlay |
 | `model.py` | Feature engineering, XGBoost training, next-close forecast (UI-free) |
+| `ticker.py` | Live ticker dashboard CLI (rich/typer) |
 
 ## Caveats
 - Stock forecasting from daily bars alone is noisy; treat results as a demo,
